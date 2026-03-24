@@ -282,7 +282,7 @@ async function uploadMedia(filePath: string, mediaType: number = 3): Promise<{ d
   if (!uploadResp.upload_param) throw new Error('getuploadurl: no upload_param returned')
 
   // Build CDN upload URL
-  const cdnUploadUrl = `${CDN_BASE}/upload?encrypted_query_param=${encodeURIComponent(uploadResp.upload_param)}&filekey=${filekey}`
+  const cdnUploadUrl = `${CDN_BASE}/c2c/upload?encrypted_query_param=${encodeURIComponent(uploadResp.upload_param)}&filekey=${filekey}`
 
   const putRes = await fetch(cdnUploadUrl, {
     method: 'POST',
@@ -700,8 +700,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
 
-        // Build CDN URL: {cdnBase}/download?encrypted_query_param={eqp}
-        const cdnUrl = `${CDN_BASE}/download?encrypted_query_param=${encodeURIComponent(info.encryptQueryParam)}`
+        // Build CDN URL: {cdnBase}/c2c/download?encrypted_query_param={eqp}
+        const cdnUrl = `${CDN_BASE}/c2c/download?encrypted_query_param=${encodeURIComponent(info.encryptQueryParam)}`
         const res = await fetch(cdnUrl)
         if (!res.ok) throw new Error(`CDN download failed: ${res.status}`)
         const encrypted = Buffer.from(await res.arrayBuffer())
