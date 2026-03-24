@@ -253,9 +253,9 @@ async function sendTyping(toUserId: string, contextToken: string): Promise<void>
   if (!ticket) return
   try {
     await apiFetch('ilink/bot/sendtyping', {
-      to_user_id: toUserId,
+      ilink_user_id: toUserId,
       typing_ticket: ticket,
-      context_token: contextToken,
+      status: 1, // 1=TYPING, 2=CANCEL
       base_info: { channel_version: '1.0.0' },
     })
   } catch (err) {
@@ -270,7 +270,7 @@ async function sendTyping(toUserId: string, contextToken: string): Promise<void>
 // 3. AES-128-ECB encrypt and POST to CDN
 // 4. CDN returns x-encrypted-param for download reference
 
-async function uploadMedia(filePath: string, toUserId: string, mediaType: number = 3): Promise<{ downloadParam: string; aesKeyHex: string; fileSize: number }> {
+async function uploadMedia(filePath: string, toUserId: string, mediaType: number = 3): Promise<{ downloadParam: string; aesKeyHex: string; fileSize: number; fileSizeCiphertext: number }> {
   const fileData = readFileSync(filePath)
   const aesKey = randomBytes(16)
   const filekey = randomBytes(16).toString('hex')
@@ -309,6 +309,7 @@ async function uploadMedia(filePath: string, toUserId: string, mediaType: number
     downloadParam,
     aesKeyHex: aesKey.toString('hex'),
     fileSize: fileData.length,
+    fileSizeCiphertext: encrypted.length,
   }
 }
 
@@ -328,7 +329,7 @@ async function sendMediaMessage(to: string, filePath: string, contextToken: stri
         aes_key: aesKeyBase64,
         encrypt_type: 1,
       },
-      mid_size: upload.fileSize,
+      mid_size: upload.fileSizeCiphertext,
     }
   } else {
     item.file_item = {
@@ -956,3 +957,10 @@ process.stdin.on('end', () => shutdown('stdin EOF'))
 process.stdin.on('error', () => shutdown('stdin error'))
 process.on('SIGTERM', () => shutdown('SIGTERM'))
 process.on('SIGINT', () => shutdown('SIGINT'))
+process.on('unhandledRejection', (err) => {
+  process.stderr.write(`wechat channel: unhandled rejection: ${err}\n`)
+})
+process.on('uncaughtException', (err) => {
+  process.stderr.write(`wechat channel: uncaught exception: ${err}\n`)
+  shutdown('uncaughtException')
+})
