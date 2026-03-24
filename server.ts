@@ -43,6 +43,18 @@ const SYNC_BUF_FILE = join(STATE_DIR, 'sync_buf.txt')
 const CONTEXT_TOKENS_FILE = join(STATE_DIR, 'context-tokens.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
 const CDN_BASE = 'https://novac2c.cdn.weixin.qq.com'
+const DEBUG_MODE_FILE = join(STATE_DIR, 'debug-mode.json')
+
+function isDebugMode(): boolean {
+  try { return JSON.parse(readFileSync(DEBUG_MODE_FILE, 'utf8')).enabled === true } catch { return false }
+}
+
+function setDebugMode(enabled: boolean): void {
+  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
+  const tmp = DEBUG_MODE_FILE + '.tmp'
+  writeFileSync(tmp, JSON.stringify({ enabled }, null, 2) + '\n', { mode: 0o600 })
+  renameSync(tmp, DEBUG_MODE_FILE)
+}
 
 // --- Load credentials ---
 
@@ -89,6 +101,7 @@ type Access = {
   pending: Record<string, PendingEntry>
   ackText?: string
   textChunkLimit?: number
+  humanDelay?: boolean
 }
 
 function defaultAccess(): Access {
@@ -201,12 +214,12 @@ async function apiFetch(endpoint: string, body: object, timeoutMs = 15000): Prom
   }
 }
 
-async function getUpdates(buf: string): Promise<any> {
+async function getUpdates(buf: string, timeoutMs = 35000): Promise<any> {
   try {
     return await apiFetch('ilink/bot/getupdates', {
       get_updates_buf: buf,
       base_info: { channel_version: '1.0.0' },
-    }, 35000)
+    }, timeoutMs)
   } catch (err: any) {
     if (err?.name === 'AbortError') {
       return { ret: 0, msgs: [], get_updates_buf: buf }
@@ -216,7 +229,7 @@ async function getUpdates(buf: string): Promise<any> {
 }
 
 async function sendMessage(to: string, text: string, contextToken: string): Promise<void> {
-  await apiFetch('ilink/bot/sendmessage', {
+  const sendResp = await apiFetch('ilink/bot/sendmessage', {
     msg: {
       from_user_id: '',
       to_user_id: to,
@@ -228,6 +241,9 @@ async function sendMessage(to: string, text: string, contextToken: string): Prom
     },
     base_info: { channel_version: '1.0.0' },
   })
+  if (sendResp?.ret === -14 || sendResp?.errcode === -14) {
+    throw new Error('session expired — re-login via /wechat:configure login')
+  }
 }
 
 // --- Typing indicator ---
@@ -263,6 +279,19 @@ async function sendTyping(toUserId: string, contextToken: string): Promise<void>
   }
 }
 
+async function cancelTyping(toUserId: string): Promise<void> {
+  const ticket = await refreshTypingTicket()
+  if (!ticket) return
+  try {
+    await apiFetch('ilink/bot/sendtyping', {
+      ilink_user_id: toUserId,
+      typing_ticket: ticket,
+      status: 2,
+      base_info: { channel_version: '1.0.0' },
+    })
+  } catch {}
+}
+
 // --- CDN media upload ---
 // Based on @tencent-weixin/openclaw-weixin v1.0.3 upload pipeline:
 // 1. Generate random filekey + aeskey
@@ -295,15 +324,29 @@ async function uploadMedia(filePath: string, toUserId: string, mediaType: number
   // Build CDN upload URL
   const cdnUploadUrl = `${CDN_BASE}/c2c/upload?encrypted_query_param=${encodeURIComponent(uploadResp.upload_param)}&filekey=${filekey}`
 
-  const putRes = await fetch(cdnUploadUrl, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/octet-stream' },
-    body: new Uint8Array(encrypted),
-  })
-
-  if (!putRes.ok) throw new Error(`CDN upload failed: ${putRes.status}`)
-
-  const downloadParam = putRes.headers.get('x-encrypted-param') ?? ''
+  const MAX_CDN_RETRIES = 3
+  let downloadParam = ''
+  for (let attempt = 1; attempt <= MAX_CDN_RETRIES; attempt++) {
+    const putRes = await fetch(cdnUploadUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/octet-stream' },
+      body: new Uint8Array(encrypted),
+    })
+    if (putRes.ok) {
+      downloadParam = putRes.headers.get('x-encrypted-param') ?? ''
+      if (!downloadParam) throw new Error('CDN upload: missing x-encrypted-param')
+      break
+    }
+    if (putRes.status >= 400 && putRes.status < 500) {
+      throw new Error(`CDN upload failed: ${putRes.status}`)
+    }
+    if (attempt < MAX_CDN_RETRIES) {
+      process.stderr.write(`wechat channel: CDN upload attempt ${attempt} failed (${putRes.status}), retrying...\n`)
+      await Bun.sleep(1000 * attempt)
+    } else {
+      throw new Error(`CDN upload failed after ${MAX_CDN_RETRIES} attempts: ${putRes.status}`)
+    }
+  }
 
   return {
     downloadParam,
@@ -313,10 +356,10 @@ async function uploadMedia(filePath: string, toUserId: string, mediaType: number
   }
 }
 
-async function sendMediaMessage(to: string, filePath: string, contextToken: string, mediaType: 'image' | 'file' = 'file'): Promise<void> {
-  const uploadMediaType = mediaType === 'image' ? 1 : 3
+async function sendMediaMessage(to: string, filePath: string, contextToken: string, mediaType: 'image' | 'video' | 'file' = 'file'): Promise<void> {
+  const uploadMediaType = mediaType === 'image' ? 1 : mediaType === 'video' ? 2 : 3
   const upload = await uploadMedia(filePath, to, uploadMediaType)
-  const itemType = mediaType === 'image' ? 2 : 4
+  const itemType = mediaType === 'image' ? 2 : mediaType === 'video' ? 5 : 4
 
   // aes_key in sendmessage: base64(hex string) — matches official format
   const aesKeyBase64 = Buffer.from(upload.aesKeyHex).toString('base64')
@@ -330,6 +373,15 @@ async function sendMediaMessage(to: string, filePath: string, contextToken: stri
         encrypt_type: 1,
       },
       mid_size: upload.fileSizeCiphertext,
+    }
+  } else if (itemType === 5) {
+    item.video_item = {
+      media: {
+        encrypt_query_param: upload.downloadParam,
+        aes_key: aesKeyBase64,
+        encrypt_type: 1,
+      },
+      video_size: upload.fileSizeCiphertext,
     }
   } else {
     item.file_item = {
@@ -389,6 +441,7 @@ function readAccessFile(): Access {
       pending: parsed.pending ?? {},
       ackText: parsed.ackText,
       textChunkLimit: parsed.textChunkLimit,
+      humanDelay: parsed.humanDelay,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
@@ -542,35 +595,54 @@ function extractText(msg: any): string {
   for (const item of items) {
     if (item.type === 1 && item.text_item?.text) {
       parts.push(item.text_item.text)
+      // Handle quoted/referenced message
+      if (item.ref_msg?.message_item) {
+        const ref = item.ref_msg.message_item
+        const refTitle = item.ref_msg.title ?? ''
+        if (ref.text_item?.text) parts.push(`[引用: ${refTitle ? refTitle + ' | ' : ''}${ref.text_item.text}]`)
+        if (ref.type === 2 && ref.image_item?.media?.encrypt_query_param) {
+          const img = ref.image_item
+          const aesKeyB64 = img.aeskey ? Buffer.from(img.aeskey, 'hex').toString('base64') : img.media?.aes_key
+          if (aesKeyB64) {
+            const id = `ref_img_${Date.now()}_${randomBytes(3).toString('hex')}`
+            pendingAttachments.set(id, { encryptQueryParam: img.media.encrypt_query_param, aesKeyBase64: aesKeyB64, filename: 'ref_image.jpg' })
+            parts.push(`(referenced image: attachment_id=${id})`)
+          }
+        }
+      }
     } else if (item.type === 2) {
       const img = item.image_item
       const eqp = img?.media?.encrypt_query_param
       const aesKeyB64 = img ? resolveImageAesKeyBase64(img) : null
-      if (eqp && aesKeyB64) {
+      if (eqp) {
         const id = `img_${Date.now()}_${randomBytes(3).toString('hex')}`
-        pendingAttachments.set(id, { encryptQueryParam: eqp, aesKeyBase64: aesKeyB64, filename: `image.jpg` })
+        pendingAttachments.set(id, { encryptQueryParam: eqp, aesKeyBase64: aesKeyB64 ?? '', filename: `image.jpg` })
         parts.push(`(image: attachment_id=${id})`)
       } else {
         parts.push('(image)')
       }
     } else if (item.type === 3) {
       const v = item.voice_item
-      const eqp = v?.media?.encrypt_query_param
-      const aesKeyB64 = v?.media?.aes_key
-      if (eqp && aesKeyB64) {
-        const id = `voice_${Date.now()}_${randomBytes(3).toString('hex')}`
-        pendingAttachments.set(id, { encryptQueryParam: eqp, aesKeyBase64: aesKeyB64, filename: `voice.silk` })
-        parts.push(`${v.text ? `(voice transcription: ${v.text}) ` : ''}(voice: attachment_id=${id})`)
+      if (v?.text) {
+        parts.push(`(voice transcription: ${v.text})`)
       } else {
-        parts.push(v?.text ?? '(voice)')
+        const eqp = v?.media?.encrypt_query_param
+        const aesKeyB64 = v?.media?.aes_key
+        if (eqp) {
+          const id = `voice_${Date.now()}_${randomBytes(3).toString('hex')}`
+          pendingAttachments.set(id, { encryptQueryParam: eqp, aesKeyBase64: aesKeyB64 ?? '', filename: `voice.silk` })
+          parts.push(`(voice: attachment_id=${id})`)
+        } else {
+          parts.push('(voice)')
+        }
       }
     } else if (item.type === 4) {
       const f = item.file_item
       const eqp = f?.media?.encrypt_query_param
       const aesKeyB64 = f?.media?.aes_key
-      if (eqp && aesKeyB64) {
+      if (eqp) {
         const id = `file_${Date.now()}_${randomBytes(3).toString('hex')}`
-        pendingAttachments.set(id, { encryptQueryParam: eqp, aesKeyBase64: aesKeyB64, filename: f.file_name ?? 'file' })
+        pendingAttachments.set(id, { encryptQueryParam: eqp, aesKeyBase64: aesKeyB64 ?? '', filename: f.file_name ?? 'file' })
         parts.push(`(file: ${f.file_name ?? 'unknown'}, attachment_id=${id})`)
       } else {
         parts.push(`(file: ${item.file_item?.file_name ?? 'unknown'})`)
@@ -579,9 +651,9 @@ function extractText(msg: any): string {
       const v = item.video_item
       const eqp = v?.media?.encrypt_query_param
       const aesKeyB64 = v?.media?.aes_key
-      if (eqp && aesKeyB64) {
+      if (eqp) {
         const id = `video_${Date.now()}_${randomBytes(3).toString('hex')}`
-        pendingAttachments.set(id, { encryptQueryParam: eqp, aesKeyBase64: aesKeyB64, filename: `video.mp4` })
+        pendingAttachments.set(id, { encryptQueryParam: eqp, aesKeyBase64: aesKeyB64 ?? '', filename: `video.mp4` })
         parts.push(`(video: attachment_id=${id})`)
       } else {
         parts.push('(video)')
@@ -681,6 +753,9 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const chunks = chunk(plainText, limit)
 
         for (const c of chunks) {
+          if (access.humanDelay && chunks.length > 1) {
+            await Bun.sleep(Math.min(c.length * 50, 3000))
+          }
           await sendMessage(userId, c, contextToken)
         }
 
@@ -696,16 +771,20 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           for (const filePath of files) {
             try {
               assertSendable(filePath)
-              const ext = filePath.toLowerCase()
-              const isImage = ext.endsWith('.jpg') || ext.endsWith('.jpeg') || ext.endsWith('.png') || ext.endsWith('.gif') || ext.endsWith('.webp')
-              await sendMediaMessage(userId, filePath, contextToken, isImage ? 'image' : 'file')
+              const ext = filePath.toLowerCase().split('.').pop() ?? ''
+              const IMAGE_EXTS = new Set(['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'tiff', 'tif', 'svg', 'ico', 'heic', 'heif', 'avif'])
+              const VIDEO_EXTS = new Set(['mp4', 'mov', 'avi', 'mkv', 'webm', 'flv', 'wmv', 'm4v', '3gp', 'mpeg', 'mpg'])
+              const mediaType: 'image' | 'video' | 'file' = IMAGE_EXTS.has(ext) ? 'image' : VIDEO_EXTS.has(ext) ? 'video' : 'file'
+              await sendMediaMessage(userId, filePath, contextToken, mediaType)
               filesSent++
             } catch (err) {
               process.stderr.write(`wechat channel: file send failed for ${filePath}: ${err}\n`)
+              try { await sendMessage(userId, `⚠️ 文件发送失败: ${(filePath as string).split('/').pop()}\n${err instanceof Error ? err.message : String(err)}`, contextToken) } catch {}
             }
           }
         }
 
+        cancelTyping(userId).catch(() => {})
         return { content: [{ type: 'text', text: `sent ${chunks.length} chunk(s)${filesSent > 0 ? ` + ${filesSent} file(s)` : ''}` }] }
       }
 
@@ -723,16 +802,41 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         const res = await fetch(cdnUrl)
         if (!res.ok) throw new Error(`CDN download failed: ${res.status}`)
         const encrypted = Buffer.from(await res.arrayBuffer())
-        const key = parseAesKey(info.aesKeyBase64)
-        const decrypted = decryptAesEcb(encrypted, key)
+        const decrypted = info.aesKeyBase64
+          ? decryptAesEcb(encrypted, parseAesKey(info.aesKeyBase64))
+          : encrypted
 
         const safeName = info.filename.replace(/[^a-zA-Z0-9._-]/g, '_')
         const outPath = join(INBOX_DIR, `${Date.now()}-${safeName}`)
         writeFileSync(outPath, decrypted, { mode: 0o600 })
 
+        let finalPath = outPath
+        if (info.filename.endsWith('.silk')) {
+          try {
+            const { decode } = await import('silk-wasm')
+            const result = await decode(decrypted, 24000)
+            const pcm = result.data
+            const wavSize = 44 + pcm.byteLength
+            const wav = Buffer.allocUnsafe(wavSize)
+            let o = 0
+            wav.write('RIFF', o); o += 4; wav.writeUInt32LE(wavSize - 8, o); o += 4
+            wav.write('WAVE', o); o += 4; wav.write('fmt ', o); o += 4
+            wav.writeUInt32LE(16, o); o += 4; wav.writeUInt16LE(1, o); o += 2
+            wav.writeUInt16LE(1, o); o += 2; wav.writeUInt32LE(24000, o); o += 4
+            wav.writeUInt32LE(48000, o); o += 4; wav.writeUInt16LE(2, o); o += 2
+            wav.writeUInt16LE(16, o); o += 2; wav.write('data', o); o += 4
+            wav.writeUInt32LE(pcm.byteLength, o); o += 4
+            Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength).copy(wav, o)
+            finalPath = outPath.replace(/\.silk$/, '.wav')
+            writeFileSync(finalPath, wav, { mode: 0o600 })
+          } catch (err) {
+            process.stderr.write(`wechat channel: silk transcode failed: ${err}\n`)
+          }
+        }
+
         pendingAttachments.delete(attachmentId)
 
-        return { content: [{ type: 'text', text: outPath }] }
+        return { content: [{ type: 'text', text: finalPath }] }
       }
 
       default:
@@ -823,6 +927,17 @@ async function handleInbound(msg: any): Promise<void> {
   // Message approved
   knownUsers.add(senderId)
 
+  const cmdText = (msg.item_list ?? []).filter((i: any) => i.type === 1 && i.text_item?.text).map((i: any) => i.text_item.text).join(' ').trim()
+  if (cmdText === '/toggle-debug') {
+    setDebugMode(!isDebugMode())
+    if (msg.context_token) await sendMessage(senderId, `Debug 模式已${isDebugMode() ? '开启' : '关闭'}`, msg.context_token).catch(() => {})
+    return
+  }
+  if (cmdText.startsWith('/echo ')) {
+    if (msg.context_token) await sendMessage(senderId, `${cmdText.slice(6)}\n\n⏱ 延迟: ${Date.now() - (msg.create_time_ms ?? Date.now())}ms`, msg.context_token).catch(() => {})
+    return
+  }
+
   // Send typing indicator
   if (msg.context_token) {
     sendTyping(senderId, msg.context_token).catch(() => {})
@@ -882,6 +997,7 @@ const MAX_FAILURES = 3
 const BACKOFF_MS = 30000
 const RETRY_MS = 2000
 let failures = 0
+let pollTimeoutMs = 35000
 let shuttingDown = false
 
 async function pollLoop(): Promise<void> {
@@ -889,9 +1005,13 @@ async function pollLoop(): Promise<void> {
 
   while (!shuttingDown) {
     try {
-      const resp = await getUpdates(getUpdatesBuf)
+      const resp = await getUpdates(getUpdatesBuf, pollTimeoutMs + 5000)
 
       if (resp.ret !== undefined && resp.ret !== 0) {
+        if (resp.ret === -14 || resp.errcode === -14) {
+          process.stderr.write('wechat channel: session expired (ret=-14), stopping poll\n')
+          break
+        }
         failures++
         process.stderr.write(`wechat channel: getUpdates error ret=${resp.ret} errmsg=${resp.errmsg ?? ''} (${failures}/${MAX_FAILURES})\n`)
         if (failures >= MAX_FAILURES) {
@@ -904,6 +1024,7 @@ async function pollLoop(): Promise<void> {
       }
 
       failures = 0
+      if (resp.longpolling_timeout_ms && typeof resp.longpolling_timeout_ms === 'number') pollTimeoutMs = resp.longpolling_timeout_ms
 
       if (resp.get_updates_buf) {
         getUpdatesBuf = resp.get_updates_buf
