@@ -3,9 +3,9 @@
 ## If you are a human / 如果你是人类
 
 WeChat (微信) channel plugin for [Claude Code](https://claude.ai/claude-code).
-Lets you chat with Claude Code from WeChat — text, images, files, voice.
+Chat with Claude Code from WeChat — text, images, files, voice, video, with remote permission relay.
 
-微信频道插件，让你可以通过微信直接与 Claude Code 对话，支持文字、图片、文件、语音。
+微信频道插件，让你可以通过微信直接与 Claude Code 对话，支持文字、图片、文件、语音、视频，以及远程权限审批。
 
 **Install / 安装：**
 
@@ -54,7 +54,7 @@ Set `$PLUGIN_ROOT` to the absolute path of the directory containing this README.
 cd "$PLUGIN_ROOT" && bun install --no-summary
 ```
 
-Verify: `node_modules/@modelcontextprotocol` and `node_modules/zod` must exist.
+Verify: `node_modules/@modelcontextprotocol`, `node_modules/zod`, and `node_modules/silk-wasm` must exist.
 
 ### Step 3 — Build validation
 
@@ -123,8 +123,8 @@ Send a test message from WeChat. It should arrive as a `<channel source="wechat"
 
 | Tool | Purpose | Required params |
 |------|---------|-----------------|
-| `reply` | Send text and/or files to WeChat | `user_id`, `text`, `context_token`; optional `files` (string array of local paths) |
-| `download_attachment` | Download media (image/voice/file/video) from WeChat CDN to local inbox | `attachment_id` |
+| `reply` | Send text and/or files to WeChat. Supports image, video, and file attachments via MIME auto-detection. | `user_id`, `text`, `context_token`; optional `files` (string array of local paths) |
+| `download_attachment` | Download media (image/voice/file/video) from WeChat CDN. AES-128-ECB decrypted automatically. Voice files (.silk) are transcoded to WAV. | `attachment_id` |
 
 ### Channel protocol
 
@@ -132,27 +132,48 @@ Send a test message from WeChat. It should arrive as a `<channel source="wechat"
 - Inbound events: `notifications/claude/channel` with meta `{user_id, context_token, ts}`
 - Outbound: via `reply` MCP tool. `context_token` is **mandatory** — without it the reply fails.
 - Permission relay: remote user can reply `yes <code>` or `no <code>` from WeChat to approve/deny tool use.
-- Media: all CDN files encrypted with AES-128-ECB. Use `download_attachment` to decrypt and save locally.
+- Media types: image (13 extensions), video (11 extensions), file (everything else). Auto-detected by file extension.
+- Voice: if `voice_item.text` exists (WeChat ASR), transcription is used directly. Otherwise audio is downloadable via `download_attachment` and transcoded from SILK to WAV.
+- Quoted messages: `ref_msg` content (text + media) is extracted and included in channel notification.
+
+### WeChat slash commands (handled by the channel, not Claude Code)
+
+| Command | Effect |
+|---------|--------|
+| `/toggle-debug` | Toggle debug mode on/off (persists to disk). When on, reply tool appends timing diagnostics. |
+| `/echo <text>` | Echo text back with channel latency measurement. Does not reach Claude. |
 
 ### Skills
 
 | Skill | Trigger |
 |-------|---------|
 | `/wechat:configure` | User asks to login, check status, or change base URL |
-| `/wechat:access` | User asks to pair, approve/remove users, or change DM policy |
+| `/wechat:access` | User asks to pair, approve/remove users, change DM policy, or configure `humanDelay`/`textChunkLimit` |
 
-### Key constraint
+### Key constraints
 
-WeChat has **no message history API**. If earlier context is needed, ask the user to paste or summarize.
+- WeChat has **no message history API**. Ask user to paste or summarize earlier context.
+- Session can expire (errcode -14). Channel auto-pauses for 1 hour. User may need to re-login via `/wechat:configure login`.
+- CDN uploads retry up to 3 times on server errors. 4xx errors fail immediately.
+
+### Access config options (in `access.json`)
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `dmPolicy` | `pairing` / `allowlist` / `disabled` | Who can message the bot |
+| `allowFrom` | `string[]` | Allowlisted user IDs |
+| `textChunkLimit` | `number` | Max chars per message (default 2000) |
+| `humanDelay` | `boolean` | Simulate typing delay (~50ms/char, max 3s) between chunks |
 
 ### State files (all under `~/.claude/channels/wechat/`)
 
 | File | Content |
 |------|---------|
 | `credentials.json` | `{token, baseUrl, userId, accountId}` |
-| `access.json` | `{dmPolicy, allowFrom[], pending{}}` |
+| `access.json` | `{dmPolicy, allowFrom[], pending{}, textChunkLimit?, humanDelay?}` |
 | `sync_buf.txt` | getUpdates long-poll cursor |
 | `context-tokens.json` | per-user context_token (debounced 5s persist) |
+| `debug-mode.json` | `{enabled: boolean}` — debug mode state |
 | `inbox/` | downloaded media attachments |
 | `approved/` | pairing approval marker files |
 
@@ -163,9 +184,11 @@ WeChat has **no message history API**. If earlier context is needed, ask the use
 | `credentials required` on start | No QR login | Run Step 5 |
 | No channel events arriving | Missing `--dangerously-load-development-channels` flag | Run Step 6 |
 | `user X is not allowlisted` | User not paired | Run Step 7 |
-| `context_token is required` | Missing from tool call | Always pass `context_token` from the inbound `<channel>` tag meta |
-| `CDN download failed` | Network or expired URL | Retry the `download_attachment` call |
+| `context_token is required` | Missing from tool call | Always pass `context_token` from inbound `<channel>` tag meta |
+| `CDN download failed` | Network or expired URL | Retry `download_attachment` |
 | `getuploadurl` returns `ret:-2` | Invalid params or expired token | Re-login via `/wechat:configure login` |
+| `session expired` error | errcode -14 from API | Channel auto-pauses 1 hour. Re-login if persists. |
+| Voice file is `.silk` format | No silk-wasm or transcode failed | Run `bun install` to ensure silk-wasm is installed |
 
 ---
 
