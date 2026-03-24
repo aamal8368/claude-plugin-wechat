@@ -683,7 +683,13 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           await sendMessage(userId, c, contextToken)
         }
 
-        const files = args.files as string[] | undefined
+        // files may arrive as a JSON string or a parsed array from MCP
+        const rawFiles = args.files
+        const files: string[] | undefined = Array.isArray(rawFiles)
+          ? rawFiles
+          : typeof rawFiles === 'string'
+            ? (() => { try { const p = JSON.parse(rawFiles); return Array.isArray(p) ? p : undefined } catch { return undefined } })()
+            : undefined
         let filesSent = 0
         if (files?.length) {
           for (const filePath of files) {
