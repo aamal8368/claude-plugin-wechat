@@ -9,7 +9,7 @@
       "source": {
         "source": "url",
         "url": "https://github.com/lc2panda/claude-plugin-wechat.git",
-        "sha": "1944d18cba0d8a3c5d8136b5adf456eac5a14eaa"
+        "sha": "115a1145bd21d31fd42ce7c226373af99514ee19"
       },
       "description": "WeChat (微信) channel for Claude Code — messaging bridge via iLink Bot API with built-in access control.",
       "version": "1.0.0"
