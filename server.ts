@@ -33,6 +33,7 @@ const CREDENTIALS_FILE = join(STATE_DIR, 'credentials.json')
 const SYNC_BUF_FILE = join(STATE_DIR, 'sync_buf.txt')
 const CONTEXT_TOKENS_FILE = join(STATE_DIR, 'context-tokens.json')
 const INBOX_DIR = join(STATE_DIR, 'inbox')
+const CDN_BASE = 'https://novac2c.cdn.weixin.qq.com'
 
 // --- Load credentials ---
 
@@ -125,7 +126,7 @@ function debouncedPersist(): void {
 }
 
 // Map attachment_id → download info for deferred media downloads
-const pendingAttachments = new Map<string, { cdnUrl: string; aesKey: string; filename: string }>()
+const pendingAttachments = new Map<string, { encryptQueryParam: string; aesKeyBase64: string; filename: string }>()
 
 // Typing indicator state
 let typingTicket = ''
@@ -254,54 +255,79 @@ async function sendTyping(toUserId: string, contextToken: string): Promise<void>
 }
 
 // --- CDN media upload ---
+// Based on @tencent-weixin/openclaw-weixin v1.0.3 upload pipeline:
+// 1. Generate random filekey + aeskey
+// 2. Call getuploadurl with file metadata
+// 3. AES-128-ECB encrypt and POST to CDN
+// 4. CDN returns x-encrypted-param for download reference
 
-async function uploadMedia(filePath: string): Promise<{ cdnUrl: string; aesKey: string; encryptedParam: string; fileSize: number }> {
+async function uploadMedia(filePath: string, mediaType: number = 3): Promise<{ downloadParam: string; aesKeyHex: string; fileSize: number }> {
   const fileData = readFileSync(filePath)
   const aesKey = randomBytes(16)
+  const filekey = randomBytes(16).toString('hex')
+  const rawfilemd5 = (await import('crypto')).createHash('md5').update(fileData).digest('hex')
   const encrypted = encryptAesEcb(fileData, aesKey)
 
   const uploadResp = await apiFetch('ilink/bot/getuploadurl', {
-    file_size: encrypted.length,
+    filekey,
+    media_type: mediaType, // 1=IMAGE, 2=VIDEO, 3=FILE, 4=VOICE
+    rawsize: fileData.length,
+    rawfilemd5,
+    filesize: encrypted.length,
+    no_need_thumb: true,
+    aeskey: aesKey.toString('hex'),
     base_info: { channel_version: '1.0.0' },
   })
 
-  if (!uploadResp.upload_url) throw new Error('getuploadurl: no upload_url returned')
+  if (!uploadResp.upload_param) throw new Error('getuploadurl: no upload_param returned')
 
-  const putRes = await fetch(uploadResp.upload_url, {
-    method: 'PUT',
+  // Build CDN upload URL
+  const cdnUploadUrl = `${CDN_BASE}/upload?encrypted_query_param=${encodeURIComponent(uploadResp.upload_param)}&filekey=${filekey}`
+
+  const putRes = await fetch(cdnUploadUrl, {
+    method: 'POST',
     headers: { 'Content-Type': 'application/octet-stream' },
-    body: encrypted,
+    body: new Uint8Array(encrypted),
   })
 
   if (!putRes.ok) throw new Error(`CDN upload failed: ${putRes.status}`)
 
+  const downloadParam = putRes.headers.get('x-encrypted-param') ?? ''
+
   return {
-    cdnUrl: uploadResp.cdn_url ?? uploadResp.upload_url,
-    aesKey: aesKey.toString('base64'),
-    encryptedParam: putRes.headers.get('x-encrypted-param') ?? '',
+    downloadParam,
+    aesKeyHex: aesKey.toString('hex'),
     fileSize: fileData.length,
   }
 }
 
 async function sendMediaMessage(to: string, filePath: string, contextToken: string, mediaType: 'image' | 'file' = 'file'): Promise<void> {
-  const upload = await uploadMedia(filePath)
+  const uploadMediaType = mediaType === 'image' ? 1 : 3
+  const upload = await uploadMedia(filePath, uploadMediaType)
   const itemType = mediaType === 'image' ? 2 : 4
+
+  // aes_key in sendmessage: base64(hex string) — matches official format
+  const aesKeyBase64 = Buffer.from(upload.aesKeyHex).toString('base64')
 
   const item: any = { type: itemType }
   if (itemType === 2) {
     item.image_item = {
-      cdn_url: upload.cdnUrl,
-      aes_key: upload.aesKey,
-      encrypted_param: upload.encryptedParam,
-      file_size: upload.fileSize,
+      media: {
+        encrypt_query_param: upload.downloadParam,
+        aes_key: aesKeyBase64,
+        encrypt_type: 1,
+      },
+      mid_size: upload.fileSize,
     }
   } else {
     item.file_item = {
-      cdn_url: upload.cdnUrl,
-      aes_key: upload.aesKey,
-      encrypted_param: upload.encryptedParam,
-      file_size: upload.fileSize,
+      media: {
+        encrypt_query_param: upload.downloadParam,
+        aes_key: aesKeyBase64,
+        encrypt_type: 1,
+      },
       file_name: filePath.split('/').pop() ?? 'file',
+      len: String(upload.fileSize),
     }
   }
 
@@ -484,6 +510,19 @@ function chunk(text: string, limit: number): string[] {
 }
 
 // --- Extract text from message items ---
+// Field mapping based on @tencent-weixin/openclaw-weixin v1.0.3 source:
+// - Image: aeskey (hex, no underscore) OR media.aes_key (base64); media.encrypt_query_param for CDN
+// - Voice/File/Video: media.aes_key (base64); media.encrypt_query_param for CDN
+
+function resolveImageAesKeyBase64(img: any): string | null {
+  // Priority 1: image_item.aeskey (hex string, no underscore) — convert to base64
+  if (img.aeskey && typeof img.aeskey === 'string' && /^[0-9a-fA-F]{32}$/.test(img.aeskey)) {
+    return Buffer.from(img.aeskey, 'hex').toString('base64')
+  }
+  // Priority 2: image_item.media.aes_key (already base64)
+  if (img.media?.aes_key) return img.media.aes_key
+  return null
+}
 
 function extractText(msg: any): string {
   const items = msg.item_list ?? []
@@ -493,36 +532,44 @@ function extractText(msg: any): string {
       parts.push(item.text_item.text)
     } else if (item.type === 2) {
       const img = item.image_item
-      if (img?.cdn_url && img?.aes_key) {
+      const eqp = img?.media?.encrypt_query_param
+      const aesKeyB64 = img ? resolveImageAesKeyBase64(img) : null
+      if (eqp && aesKeyB64) {
         const id = `img_${Date.now()}_${randomBytes(3).toString('hex')}`
-        pendingAttachments.set(id, { cdnUrl: img.cdn_url, aesKey: img.aes_key, filename: `image.jpg` })
+        pendingAttachments.set(id, { encryptQueryParam: eqp, aesKeyBase64: aesKeyB64, filename: `image.jpg` })
         parts.push(`(image: attachment_id=${id})`)
       } else {
         parts.push('(image)')
       }
     } else if (item.type === 3) {
       const v = item.voice_item
-      if (v?.cdn_url && v?.aes_key) {
+      const eqp = v?.media?.encrypt_query_param
+      const aesKeyB64 = v?.media?.aes_key
+      if (eqp && aesKeyB64) {
         const id = `voice_${Date.now()}_${randomBytes(3).toString('hex')}`
-        pendingAttachments.set(id, { cdnUrl: v.cdn_url, aesKey: v.aes_key, filename: `voice.silk` })
+        pendingAttachments.set(id, { encryptQueryParam: eqp, aesKeyBase64: aesKeyB64, filename: `voice.silk` })
         parts.push(`${v.text ? `(voice transcription: ${v.text}) ` : ''}(voice: attachment_id=${id})`)
       } else {
         parts.push(v?.text ?? '(voice)')
       }
     } else if (item.type === 4) {
       const f = item.file_item
-      if (f?.cdn_url && f?.aes_key) {
+      const eqp = f?.media?.encrypt_query_param
+      const aesKeyB64 = f?.media?.aes_key
+      if (eqp && aesKeyB64) {
         const id = `file_${Date.now()}_${randomBytes(3).toString('hex')}`
-        pendingAttachments.set(id, { cdnUrl: f.cdn_url, aesKey: f.aes_key, filename: f.file_name ?? 'file' })
+        pendingAttachments.set(id, { encryptQueryParam: eqp, aesKeyBase64: aesKeyB64, filename: f.file_name ?? 'file' })
         parts.push(`(file: ${f.file_name ?? 'unknown'}, attachment_id=${id})`)
       } else {
         parts.push(`(file: ${item.file_item?.file_name ?? 'unknown'})`)
       }
     } else if (item.type === 5) {
       const v = item.video_item
-      if (v?.cdn_url && v?.aes_key) {
+      const eqp = v?.media?.encrypt_query_param
+      const aesKeyB64 = v?.media?.aes_key
+      if (eqp && aesKeyB64) {
         const id = `video_${Date.now()}_${randomBytes(3).toString('hex')}`
-        pendingAttachments.set(id, { cdnUrl: v.cdn_url, aesKey: v.aes_key, filename: `video.mp4` })
+        pendingAttachments.set(id, { encryptQueryParam: eqp, aesKeyBase64: aesKeyB64, filename: `video.mp4` })
         parts.push(`(video: attachment_id=${id})`)
       } else {
         parts.push('(video)')
@@ -653,10 +700,12 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
 
         mkdirSync(INBOX_DIR, { recursive: true, mode: 0o700 })
 
-        const res = await fetch(info.cdnUrl)
+        // Build CDN URL: {cdnBase}/download?encrypted_query_param={eqp}
+        const cdnUrl = `${CDN_BASE}/download?encrypted_query_param=${encodeURIComponent(info.encryptQueryParam)}`
+        const res = await fetch(cdnUrl)
         if (!res.ok) throw new Error(`CDN download failed: ${res.status}`)
         const encrypted = Buffer.from(await res.arrayBuffer())
-        const key = parseAesKey(info.aesKey)
+        const key = parseAesKey(info.aesKeyBase64)
         const decrypted = decryptAesEcb(encrypted, key)
 
         const safeName = info.filename.replace(/[^a-zA-Z0-9._-]/g, '_')
