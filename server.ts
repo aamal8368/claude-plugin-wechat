@@ -281,17 +281,10 @@ async function uploadMedia(filePath: string, toUserId: string, mediaType: number
     base_info: { channel_version: '1.0.0' },
   })
 
-  // Debug: dump getuploadurl response
-  try {
-    mkdirSync(join(STATE_DIR, 'debug'), { recursive: true })
-    writeFileSync(join(STATE_DIR, 'debug', `upload-resp-${Date.now()}.json`), JSON.stringify(uploadResp, null, 2) + '\n')
-  } catch {}
-
-  const uploadParam = uploadResp.upload_param ?? uploadResp.uploadParam ?? uploadResp.upload_url
-  if (!uploadParam) throw new Error(`getuploadurl: no upload_param in response: ${JSON.stringify(Object.keys(uploadResp))}`)
+  if (!uploadResp.upload_param) throw new Error('getuploadurl: no upload_param returned')
 
   // Build CDN upload URL
-  const cdnUploadUrl = `${CDN_BASE}/c2c/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${filekey}`
+  const cdnUploadUrl = `${CDN_BASE}/c2c/upload?encrypted_query_param=${encodeURIComponent(uploadResp.upload_param)}&filekey=${filekey}`
 
   const putRes = await fetch(cdnUploadUrl, {
     method: 'POST',
@@ -692,12 +685,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
               await sendMediaMessage(userId, filePath, contextToken, isImage ? 'image' : 'file')
               filesSent++
             } catch (err) {
-              const errMsg = err instanceof Error ? err.stack ?? err.message : String(err)
-              process.stderr.write(`weixin channel: file send failed for ${filePath}: ${errMsg}\n`)
-              try {
-                mkdirSync(join(STATE_DIR, 'debug'), { recursive: true })
-                writeFileSync(join(STATE_DIR, 'debug', `upload-error-${Date.now()}.txt`), `${filePath}\n${errMsg}\n`)
-              } catch {}
+              process.stderr.write(`weixin channel: file send failed for ${filePath}: ${err}\n`)
             }
           }
         }
@@ -787,16 +775,6 @@ await mcp.connect(new StdioServerTransport())
 // --- Inbound message handler ---
 
 async function handleInbound(msg: any): Promise<void> {
-  // Dump raw message to file for debugging
-  try {
-    mkdirSync(join(STATE_DIR, 'debug'), { recursive: true })
-    writeFileSync(
-      join(STATE_DIR, 'debug', `msg-${Date.now()}.json`),
-      JSON.stringify(msg, null, 2) + '\n',
-    )
-  } catch {}
-  process.stderr.write(`weixin channel: inbound msg type=${msg.message_type} items=${JSON.stringify((msg.item_list ?? []).map((i: any) => ({ type: i.type, has_cdn: !!(i.image_item?.cdn_url || i.voice_item?.cdn_url || i.file_item?.cdn_url || i.video_item?.cdn_url) })))}\n`)
-
   if (msg.message_type !== 1) return
 
   const senderId = msg.from_user_id
